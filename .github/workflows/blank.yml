@@ -1,0 +1,142 @@
+name: CI/CD Aplikasi Digital Kampus
+
+# Alur Bab VII: Push -> Build -> Test (unit, SAST, scan dependensi)
+# -> Image registry -> Deploy staging -> Persetujuan -> Deploy production
+# Langkah otomatis dilewati bila file pendukungnya belum ada di repo.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  detect:
+    name: Deteksi isi repo
+    runs-on: ubuntu-latest
+    outputs:
+      node: ${{ steps.d.outputs.node }}
+      docker: ${{ steps.d.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: d
+        run: |
+          [ -f package.json ] && echo "node=true" >> "$GITHUB_OUTPUT" || echo "node=false" >> "$GITHUB_OUTPUT"
+          [ -f Dockerfile ] && echo "docker=true" >> "$GITHUB_OUTPUT" || echo "docker=false" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Unit test dan lint
+    needs: detect
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - if: needs.detect.outputs.node == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - if: needs.detect.outputs.node == 'true'
+        run: |
+          npm ci || npm install
+          npm run lint --if-present
+          npm test --if-present
+      - if: needs.detect.outputs.node != 'true'
+        run: echo "package.json belum ada, unit test dilewati"
+
+  sast:
+    name: SAST (CodeQL)
+    needs: detect
+    if: needs.detect.outputs.node == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+      - uses: github/codeql-action/analyze@v3
+
+  dependencies:
+    name: Scan dependensi
+    needs: detect
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - if: needs.detect.outputs.node == 'true'
+        run: npm audit --audit-level=high || true
+      - if: needs.detect.outputs.node != 'true'
+        run: echo "package.json belum ada, scan dependensi dilewati"
+
+  build:
+    name: Build dan push image
+    needs: [detect, test, sast, dependencies]
+    # sast boleh dilewati (skipped), tetapi tidak boleh gagal
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - if: needs.detect.outputs.docker != 'true'
+        run: echo "Dockerfile belum ada, build image dilewati"
+      - name: Nama image (huruf kecil)
+        if: needs.detect.outputs.docker == 'true'
+        run: echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - if: needs.detect.outputs.docker == 'true'
+        uses: docker/setup-buildx-action@v3
+      - name: Build image
+        if: needs.detect.outputs.docker == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+      - name: Scan image (Trivy)
+        if: needs.detect.outputs.docker == 'true'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Login GHCR
+        if: needs.detect.outputs.docker == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image
+        if: needs.detect.outputs.docker == 'true' && github.event_name != 'pull_request'
+        run: docker push ${{ env.IMAGE }}:${{ github.sha }}
+
+  deploy-staging:
+    name: Deploy ke staging
+    needs: build
+    if: ${{ !cancelled() && !failure() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Deploy (simulasi)
+        run: |
+          echo "Deploy commit ${{ github.sha }} ke staging"
+          echo "Uji integrasi/UAT dan load test dijalankan di tahap ini"
+
+  deploy-production:
+    name: Deploy ke production
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production   # menunggu persetujuan Operations bila Required reviewers aktif
+    steps:
+      - name: Deploy rolling (simulasi)
+        run: |
+          echo "Deploy commit ${{ github.sha }} ke production"
+          echo "Health check OK, rollback tidak diperlukan"
